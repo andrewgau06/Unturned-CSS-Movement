@@ -54,5 +54,8 @@ public static class CLCIReport
 		{
 			File.Delete(reportPath);
 		}
+
+		// The Build_Scripts directory is part of the internal build setup and isn't included in the SDK.
+		Directory.CreateDirectory(Path.GetDirectoryName(reportPath));
 	}
 }

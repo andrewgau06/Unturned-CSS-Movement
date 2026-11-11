@@ -35,6 +35,16 @@ namespace SDG.Unturned.Tools
 				BuildMethods.runBuild(standalonePlatforms: true, test: false);
 			}
 
+			// Mod sharing: needs only the Windows build support that comes with the editor (plus Windows Dedicated
+			// Server Build Support for the server), unlike the full release pipeline above.
+			string windowsPackageLabel = BuildMethods.IsWindowsDedicatedServerModuleInstalled()
+				? "Build & Package Windows 64-bit (Game + Server)"
+				: "Build & Package Windows 64-bit (Game only, server module not installed)";
+			if (GUILayout.Button(windowsPackageLabel))
+			{
+				BuildMethods.BuildAndPackageWindows64();
+			}
+
 			if (GUILayout.Button("Code Documentation"))
 			{
 				BuildMethods.BuildCodeDocs();
