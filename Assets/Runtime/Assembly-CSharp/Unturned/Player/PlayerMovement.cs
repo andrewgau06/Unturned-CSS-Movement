@@ -90,17 +90,8 @@ namespace SDG.Unturned
 
 		private static readonly float SPEED_CLIMB = 4.5f;
 		private static readonly float SPEED_SWIM = 3f;
-		private static readonly float SPEED_SPRINT = 7f;
-		private static readonly float SPEED_STAND = 4.5f;
-		private static readonly float SPEED_CROUCH = 2.5f;
-		private static readonly float SPEED_PRONE = 1.5f;
 
-		/// <summary>
-		/// Jump speed = sqrt(2 * jump height * gravity)
-		/// Jump height = (jump speed ^ 2) / (2 * gravity)
-		/// With 7 speed and 9.81 * 3 gravity = apex height of 1.66496772
-		/// </summary>
-		private static readonly float JUMP = 7.0f;
+		// Walking speeds and jumping are CS:S values in SourceMovement.
 		private static readonly float SWIM = 3;
 
 		/// <summary>
@@ -151,6 +142,8 @@ namespace SDG.Unturned
 			// Adjusting last update pos is particularly important for first-person view interpolation.
 			Vector3 relativeLastUpdatePos = inputTransform.InverseTransformPoint(lastUpdatePos);
 			lastUpdatePos = outputTransform.TransformPoint(relativeLastUpdatePos);
+
+			source?.OnTeleported();
 
 			player.PostTeleport();
 		}
@@ -306,21 +299,20 @@ namespace SDG.Unturned
 					{
 						return SPEED_CLIMB * exercise * totalSpeedMultiplier;
 					}
-					else if (player.stance.stance == EPlayerStance.SPRINT)
+
+					// CS:S max ground speeds (no skill bonus). The actual walking simulation is in SourceMovement.
+					float runSpeed = SourceMovement.RunSpeedMeters * totalSpeedMultiplier;
+					if (player.stance.stance == EPlayerStance.STAND || player.stance.stance == EPlayerStance.SPRINT)
 					{
-						return SPEED_SPRINT * exercise * totalSpeedMultiplier;
-					}
-					else if (player.stance.stance == EPlayerStance.STAND)
-					{
-						return SPEED_STAND * exercise * totalSpeedMultiplier;
+						return runSpeed;
 					}
 					else if (player.stance.stance == EPlayerStance.CROUCH)
 					{
-						return SPEED_CROUCH * exercise * totalSpeedMultiplier;
+						return runSpeed * SourceMovement.DUCK_SPEED_MODIFIER;
 					}
 					else if (player.stance.stance == EPlayerStance.PRONE)
 					{
-						return SPEED_PRONE * exercise * totalSpeedMultiplier;
+						return runSpeed * SourceMovement.PRONE_SPEED_MODIFIER;
 					}
 				}
 
@@ -721,6 +713,7 @@ namespace SDG.Unturned
 			pendingLaunchVelocity = Vector3.zero;
 			velocity = Vector3.zero; // Reset velocity on death.
 			mostRecentControllerColliderHit = null;
+			source?.OnTeleported();
 		}
 
 		private void checkGround(Vector3 position)
@@ -808,6 +801,7 @@ namespace SDG.Unturned
 #endif
 
 			lastFootstep = Time.time;
+			lastFootstepPosition = transform.position;
 
 			return true;
 		}
@@ -1103,310 +1097,17 @@ namespace SDG.Unturned
 
 				return;
 			}
-			else if (player.stance.stance == EPlayerStance.CLIMB)
-			{
-				_isMoving = Mathf.Abs(move.x) > 0.1 || Mathf.Abs(move.z) > 0.1;
-				checkGround(transform.position);
-
-				// Nelson 2025-09-01: previously, this always set pendingLaunchVelocity to zero.
-				// However, when air acceleration multiplier is low, the player isn't necessarily
-				// able to build up enough speed to move off the ladder and onto a surface in front.
-				// E.g., public issue #5106, and on maps which override the default air acceleration.
-				// *Usually* if the player is holding forward input they will immediately start
-				// walking forward after exiting the ladder, so if the player is holding forward
-				// while climbing I think it's reasonable to queue up a small forward boost.
-				if (move.z > 0.1f)
-				{
-					pendingLaunchVelocity = transform.rotation * new Vector3(0.0f, 0.0f, 0.5f);
-				}
-				else
-				{
-					pendingLaunchVelocity = Vector3.zero;
-				}
-
-				velocity = new Vector3(0.0f, _move.z * speed * 0.5f, 0.0f);
-				mostRecentControllerColliderHit = null;
-				if (controller.enabled)
-				{
-					controller.CheckedMove(velocity * deltaTime);
-				}
-			}
-			else if (player.stance.stance == EPlayerStance.SWIM)
-			{
-				_isMoving = Mathf.Abs(move.x) > 0.1 || Mathf.Abs(move.z) > 0.1;
-				checkGround(transform.position);
-
-				pendingLaunchVelocity = Vector3.zero;
-
-				if (player.stance.isSubmerged || (player.look.pitch > 110 && move.z > 0.1))
-				{
-					velocity = player.look.aim.rotation * move.normalized * speed * 1.5f;
-					if (inputJump)
-					{
-						velocity.y = SWIM * pluginJumpMultiplier;
-					}
-
-					mostRecentControllerColliderHit = null;
-					if (controller.enabled)
-					{
-						controller.CheckedMove(velocity * deltaTime);
-					}
-				}
-				else
-				{
-					// Swimming along surface
-
-					bool isUnderwater;
-					float surfaceElevation;
-					WaterUtility.getUnderwaterInfo(transform.position, out isUnderwater, out surfaceElevation);
-
-					velocity = transform.rotation * move.normalized * speed * 1.5f;
-					velocity.y = (surfaceElevation - 1.275f - transform.position.y) / 8f;
-
-					mostRecentControllerColliderHit = null;
-					if (controller.enabled)
-					{
-						controller.CheckedMove(velocity * deltaTime);
-					}
-				}
-			}
 			else
 			{
+				// Walking, ladder and swimming physics run once per 100 Hz command in RunSourceCmd (predicted by the
+				// client in Update, replayed by the server from the input packet). This 12.5 Hz tick only refreshes
+				// the ground material used for footsteps, fall damage and surface friction.
 				_isMoving = Mathf.Abs(move.x) > 0.1 || Mathf.Abs(move.z) > 0.1;
-				bool wasGrounded = isGrounded;
 				checkGround(transform.position);
-
-				bool updateVelocityAfterMove = false;
-				bool sliding = false;
-				Vector3 slidingGroundNormal = Vector3.up;
-
-				if (isGrounded && ground.normal.y > 0)
+				if (source != null && player.stance.stance != EPlayerStance.CLIMB && player.stance.stance != EPlayerStance.SWIM)
 				{
-					float angle = Vector3.Angle(Vector3.up, ground.normal);
-
-					float maxWalkableSlope = 59;
-					if (Level.info != null && Level.info.configData != null && Level.info.configData.Max_Walkable_Slope > -0.5f)
-					{
-						maxWalkableSlope = Level.info.configData.Max_Walkable_Slope;
-					}
-
-					sliding = angle > maxWalkableSlope;
-					slidingGroundNormal = ground.normal;
-				}
-
-				if (!sliding)
-				{
-					if (mostRecentControllerColliderHit != null
-						&& mostRecentControllerColliderHit.collider != null // public issue #3726
-						&& mostRecentControllerColliderHit.gameObject != null
-						&& mostRecentControllerColliderHit.normal.y > 0.0f
-						&& mostRecentControllerColliderHit.gameObject.CompareTag("Agent"))
-					{
-						// Prevent standing on zombie head.
-						sliding = true;
-						slidingGroundNormal = mostRecentControllerColliderHit.normal;
-					}
-				}
-
-				if (sliding)
-				{
-					Vector3 perp = Vector3.Cross(Vector3.up, slidingGroundNormal).normalized;
-					Vector3 slide = Vector3.Cross(perp, slidingGroundNormal).normalized;
-					velocity += slide * 16.0f * deltaTime;
-
-					// Prevent building up huge velocity by sliding against a wall.
-					updateVelocityAfterMove = true;
-				}
-				else
-				{
-					Vector3 desiredWalkVelocity = transform.rotation * move.normalized * speed;
-
-					if (isGrounded)
-					{
-						PhysicsMaterialCharacterFrictionProperties frictionProperties = PhysicMaterialCustomData.GetCharacterFrictionProperties(materialName);
-						if (frictionProperties.mode == EPhysicsMaterialCharacterFrictionMode.ImmediatelyResponsive)
-						{
-							// Rather than adding gravity while grounded to smoothly walk down slopes, we adjust the
-							// downward velocity to align with the floor plane. We do not allow an upward velocity here
-							// because it would bounce us over the top of the ramp while walking up a slope.
-							Vector3 desiredWalkRightDirection = Vector3.Cross(Vector3.up, desiredWalkVelocity).normalized;
-							Vector3 desiredWalkForwardDirection = Vector3.Cross(desiredWalkRightDirection, ground.normal).normalized;
-							desiredWalkVelocity = desiredWalkForwardDirection * speed;
-							desiredWalkVelocity.y = Mathf.Min(desiredWalkVelocity.y, 0.0f);
-
-							// Immediately responsive
-							velocity = desiredWalkVelocity;
-						}
-						else
-						{
-							Vector3 currentVelocityAlongFloor = Vector3.ProjectOnPlane(velocity, ground.normal);
-							float currentSpeedAlongFloor = currentVelocityAlongFloor.magnitude;
-
-							Vector3 desiredWalkRightDirection = Vector3.Cross(Vector3.up, desiredWalkVelocity).normalized;
-							Vector3 desiredWalkDirectionAlongFloor = Vector3.Cross(desiredWalkRightDirection, ground.normal).normalized;
-							Vector3 desiredWalkVelocityAlongFloor = desiredWalkDirectionAlongFloor * speed;
-							// note we do not clamp Y component here so that we can slide off jumps
-							desiredWalkVelocityAlongFloor *= frictionProperties.maxSpeedMultiplier;
-							float desiredSpeed = desiredWalkVelocityAlongFloor.magnitude;
-
-							float maxSpeed;
-							if (currentSpeedAlongFloor > desiredSpeed)
-							{
-								// Base deceleration is 2.0 m/s²
-								float deceleration = -2.0f * frictionProperties.decelerationMultiplier;
-								maxSpeed = Mathf.Max(desiredSpeed, currentSpeedAlongFloor + (deceleration * deltaTime));
-							}
-							else
-							{
-								maxSpeed = desiredSpeed;
-							}
-
-							// Questionable units-wise, but pretend base acceleration is proportional to desired speed.
-							// For example if walk speed is 4.5 m/s then acceleration is 4.5 m/s².
-							Vector3 acceleration = desiredWalkVelocityAlongFloor * frictionProperties.accelerationMultiplier;
-
-							Vector3 newVelocity = currentVelocityAlongFloor + (acceleration * deltaTime);
-							velocity = newVelocity.ClampMagnitude(maxSpeed);
-
-							// Prevent sticking to walls at high velocity.
-							updateVelocityAfterMove = true;
-						}
-					}
-					else
-					{
-						velocity.y += Physics.gravity.y * (fall <= 0 ? totalGravityMultiplier : 1f) * deltaTime * 3;
-
-						// Clamp free-fall / terminal velocity
-						float minVerticalVelocity = totalGravityMultiplier < 0.99f ? Physics.gravity.y * 2.0f * totalGravityMultiplier : -100.0f;
-						velocity.y = Mathf.Max(minVerticalVelocity, velocity.y);
-
-						// Midair, maybe with already high rocket-jump speed
-						float desiredWalkSpeed = desiredWalkVelocity.GetHorizontalMagnitude();
-						Vector3 currentHorizontalVelocity = velocity.GetHorizontal();
-						float currentHorizontalSpeed = velocity.GetHorizontalMagnitude();
-						float maxHorizontalSpeed;
-						if (currentHorizontalSpeed > desiredWalkSpeed)
-						{
-							float deceleration = 2.0f * Provider.modeConfigData.Gameplay.AirStrafing_Deceleration_Multiplier;
-							maxHorizontalSpeed = Mathf.Max(desiredWalkSpeed, currentHorizontalSpeed - (deceleration * deltaTime));
-						}
-						else
-						{
-							maxHorizontalSpeed = desiredWalkSpeed;
-						}
-						Vector3 accel = desiredWalkVelocity * (8.0f * Provider.modeConfigData.Gameplay.AirStrafing_Acceleration_Multiplier);
-						Vector3 newHorizontalVelocity = currentHorizontalVelocity + (accel * deltaTime);
-						newHorizontalVelocity = newHorizontalVelocity.ClampHorizontalMagnitude(maxHorizontalSpeed);
-						velocity.x = newHorizontalVelocity.x;
-						velocity.z = newHorizontalVelocity.z;
-
-						// Prevent sticking to walls at high velocity.
-						updateVelocityAfterMove = true;
-					}
-				}
-
-				if (inputJump)
-				{
-					if (isGrounded && !player.life.isBroken && player.life.stamina >= 10 * (1f - (player.skills.mastery((int) EPlayerSpeciality.OFFENSE, (int) EPlayerOffense.PARKOUR) * 0.5f)) && (player.stance.stance == EPlayerStance.STAND || player.stance.stance == EPlayerStance.SPRINT) && !MathfEx.IsNearlyZero(pluginJumpMultiplier, 0.001f))
-					{
-						velocity.y = JUMP * (1f + (player.skills.mastery((int) EPlayerSpeciality.OFFENSE, (int) EPlayerOffense.PARKOUR) * 0.25f)) * pluginJumpMultiplier;
-						player.life.askTire((byte) (10 * (1f - (player.skills.mastery((int) EPlayerSpeciality.OFFENSE, (int) EPlayerOffense.PARKOUR) * 0.5f))));
-					}
-				}
-
-				velocity += pendingLaunchVelocity;
-				pendingLaunchVelocity = Vector3.zero;
-
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-				if (enableFly && MainCamera.instance != null)
-				{
-					velocity = MainCamera.instance.transform.rotation * move * speed;
-					if (player.stance.stance == EPlayerStance.SPRINT)
-					{
-						velocity *= 2.0f;
-					}
-				}
-#endif // UNITY_EDITOR || DEVELOPMENT_BUILD
-
-				if (channel.IsLocalPlayer && LoadingUI.isBlocked)
-				{
-					// Client does not move or fall while loading into the level. Potentially important in
-					// singleplayer while waiting for the surrounding geometry to enable its collision.
-					velocity = Vector3.zero;
-				}
-				else
-				{
-					Vector3 oldPosition = transform.position;
-					mostRecentControllerColliderHit = null;
-					if (controller.enabled)
-					{
-						controller.CheckedMove(velocity * deltaTime);
-					}
-
-					// Moved from the earlier ground test because we want onLanded to happen before updateVelocityAfterMove 
-					if (!wasGrounded)
-					{
-						checkGround(transform.position);
-
-						if (isGrounded)
-						{
-							// Before velocity was added this passed the vertical distance from the last grounded height.
-							onLanded?.Invoke(velocity.y);
-
-#if !DEDICATED_SERVER
-							if (!player.input.isResimulating && Mathf.Abs(velocity.y) > 1.0f)
-							{
-								PlayLandAudioClip();
-							}
-#endif // !DEDICATED_SERVER
-						}
-					}
-					else
-					{
-						// Player *was* grounded, so let's see if we should slightly snap the player to the ground.
-						// Don't snap if velocity was upward to prevent sticking to ground when e.g. jumping.
-						if (velocity.y < 0.01f)
-						{
-							int mask = RayMasks.BLOCK_COLLISION;
-							float CAST_RADIUS = PlayerStance.RADIUS - 0.001f;
-							float snapLength = controller.stepOffset + SKIN_WIDTH;
-							Ray snapRay = new Ray(transform.position + new Vector3(0.0f, CAST_RADIUS, 0.0f), Vector3.down);
-							bool snapRayHit = Physics.SphereCast(snapRay, CAST_RADIUS, out RaycastHit snapHit, snapLength, mask, QueryTriggerInteraction.Ignore);
-#if WITH_FLOOR_SNAPPING_GIZMOS
-							RuntimeGizmos.Get().Spherecast(snapRay, CAST_RADIUS, snapLength, snapHit, Color.green, Color.red, 0.1f);
-#endif
-							if (snapRayHit)
-							{
-								float snapDelta = (snapHit.distance - SKIN_WIDTH);
-								if (snapDelta > Mathf.Epsilon)
-								{
-									Vector3 snapFloorNormal = snapHit.normal;
-									float maxWalkableSlope = 59;
-									if (Level.info != null && Level.info.configData != null && Level.info.configData.Max_Walkable_Slope > -0.5f)
-									{
-										maxWalkableSlope = Level.info.configData.Max_Walkable_Slope;
-									}
-
-									// Nelson 2024-08-19: Snapping to *any* surface was quickly exploited to climb trees!
-									bool canSnap = Vector3.Angle(Vector3.up, snapFloorNormal) < maxWalkableSlope;
-#if WITH_FLOOR_SNAPPING_GIZMOS
-									RuntimeGizmos.Get().Arrow(snapHit.point, snapHit.normal, 0.4f, canSnap ? Color.green : Color.red, 0.1f, EGizmoLayer.Foreground);
-#endif
-									if (canSnap)
-									{
-										transform.position += new Vector3(0.0f, -snapDelta, 0.0f);
-									}
-								}
-							}
-						}
-					}
-
-					if (updateVelocityAfterMove)
-					{
-						// We do not always want to do this, for example when walking up a slope this would launch
-						// us over the top. Useful while midair to prevent player from sticking to walls at high velocity.
-						velocity = (transform.position - oldPosition) / deltaTime;
-					}
+					_isGrounded = source.onGround;
+					source.RefreshGroundMaterial(materialName);
 				}
 			}
 
@@ -1492,6 +1193,321 @@ namespace SDG.Unturned
 				}
 			}
 		}
+
+		#region CS:S 100 tick movement
+
+		/// <summary>
+		/// Upper bound on 100 Hz ticks the client simulates in a single frame after a hitch.
+		/// </summary>
+		private const int MAX_CLIENT_SOURCE_TICKS_PER_FRAME = 25;
+
+		/// <summary>
+		/// Upper bound on predicted-but-unsent commands. Normally emptied every 80 ms by PlayerInput.
+		/// </summary>
+		private const int MAX_CLIENT_PENDING_SOURCE_CMDS = 256;
+
+		/// <summary>
+		/// CS:S movement state. Only exists for the local player and on the server.
+		/// </summary>
+		internal SourceMovement source { get; private set; }
+
+		/// <summary>
+		/// Local player only: mouse turn rate vs ideal strafe turn rate, for the HUD.
+		/// </summary>
+		internal readonly StrafeTrainer strafeTrainer = new StrafeTrainer();
+
+		private readonly List<SourceUserCmd> clientPendingSourceCmds = new List<SourceUserCmd>();
+		private float clientSourceTickAccumulator;
+		private bool clientHasSourceInterpolation;
+		private Vector3 clientSourceInterpolationFrom;
+		private Vector3 clientSourceInterpolationTo;
+		private Vector3 lastFootstepPosition;
+
+		/// <summary>
+		/// CS:S ticks move the transform directly, so the CharacterController needs syncing before the
+		/// ladder or swimming code moves it again.
+		/// </summary>
+		private bool sourceMovedTransformDirectly;
+
+		internal bool CanRunSourceCmd => source != null
+			&& controller != null
+			&& controller.enabled
+			&& vehicle == null
+			&& !hasPendingVehicleChange
+			&& player.life.IsAlive
+			&& player.stance.stance != EPlayerStance.SITTING
+			&& player.stance.stance != EPlayerStance.DRIVING;
+
+		/// <summary>
+		/// Simulate one 100 Hz command. Shared by client prediction, client resimulation and server replay,
+		/// so it must only depend on the command and replicated state.
+		/// </summary>
+		internal void RunSourceCmd(in SourceUserCmd cmd)
+		{
+			if (!CanRunSourceCmd)
+				return;
+
+			_move.x = cmd.MoveX;
+			_move.z = cmd.MoveZ;
+			_isMoving = cmd.MoveX != 0 || cmd.MoveZ != 0;
+			source.tickOriginShift = 0.0f;
+			source.strafeSampleValid = false;
+
+			EPlayerStance stance = player.stance.stance;
+			if (stance == EPlayerStance.CLIMB || stance == EPlayerStance.SWIM)
+			{
+				if (sourceMovedTransformDirectly)
+				{
+					Physics.SyncTransforms();
+					sourceMovedTransformDirectly = false;
+				}
+
+				mostRecentControllerColliderHit = null;
+				if (stance == EPlayerStance.CLIMB)
+				{
+					SimulateLegacyClimbTick(cmd);
+				}
+				else
+				{
+					SimulateLegacySwimTick(cmd);
+				}
+
+				_isGrounded = true;
+				source.OnLegacyTick(cmd);
+			}
+			else
+			{
+				source.Tick(cmd);
+				sourceMovedTransformDirectly = true;
+				_isGrounded = source.onGround;
+			}
+		}
+
+		/// <summary>
+		/// Unturned's ladder movement, unchanged apart from running per 100 Hz command.
+		/// </summary>
+		private void SimulateLegacyClimbTick(in SourceUserCmd cmd)
+		{
+			// Nelson 2025-09-01: when air acceleration is low the player isn't necessarily able to build up enough
+			// speed to move off the ladder and onto a surface in front, so queue up a small forward boost.
+			if (move.z > 0.1f)
+			{
+				pendingLaunchVelocity = Quaternion.Euler(0.0f, cmd.Yaw, 0.0f) * new Vector3(0.0f, 0.0f, 0.5f);
+			}
+			else
+			{
+				pendingLaunchVelocity = Vector3.zero;
+			}
+
+			velocity = new Vector3(0.0f, _move.z * speed * 0.5f, 0.0f);
+			controller.CheckedMove(velocity * SourceMovement.TICK_INTERVAL);
+		}
+
+		/// <summary>
+		/// Unturned's swimming movement, unchanged apart from running per 100 Hz command.
+		/// </summary>
+		private void SimulateLegacySwimTick(in SourceUserCmd cmd)
+		{
+			pendingLaunchVelocity = Vector3.zero;
+
+			Quaternion yawRotation = Quaternion.Euler(0.0f, cmd.Yaw, 0.0f);
+			if (player.stance.isSubmerged || (cmd.Pitch > 110 && move.z > 0.1))
+			{
+				Quaternion aimRotation = yawRotation * Quaternion.Euler(cmd.Pitch - 90.0f, 0.0f, 0.0f);
+				velocity = aimRotation * move.normalized * speed * 1.5f;
+				if (cmd.IsHeld(SourceUserCmd.IN_JUMP))
+				{
+					velocity.y = SWIM * pluginJumpMultiplier;
+				}
+			}
+			else
+			{
+				// Swimming along surface
+				WaterUtility.getUnderwaterInfo(transform.position, out bool isUnderwater, out float surfaceElevation);
+				velocity = yawRotation * move.normalized * speed * 1.5f;
+				velocity.y = (surfaceElevation - 1.275f - transform.position.y) / 8f;
+			}
+
+			controller.CheckedMove(velocity * SourceMovement.TICK_INTERVAL);
+		}
+
+		/// <summary>
+		/// Server replays the commands from an input packet. (Count was already limited by PlayerInput.)
+		/// Client resimulation replays commands from input history.
+		/// </summary>
+		internal void SimulateSourceCmds(SourceUserCmd[] cmds, int count)
+		{
+			if (cmds == null)
+				return;
+
+			count = Mathf.Min(count, cmds.Length);
+			for (int index = 0; index < count; ++index)
+			{
+				RunSourceCmd(cmds[index]);
+			}
+		}
+
+		/// <summary>
+		/// Take up to one packet's worth of commands predicted since the previous packet.
+		/// </summary>
+		internal SourceUserCmd[] ClientFlushSourceCmds(int maxCount)
+		{
+			int count = Mathf.Min(clientPendingSourceCmds.Count, maxCount);
+			if (count <= 0)
+				return System.Array.Empty<SourceUserCmd>();
+
+			SourceUserCmd[] cmds = new SourceUserCmd[count];
+			clientPendingSourceCmds.CopyTo(0, cmds, 0, count);
+			clientPendingSourceCmds.RemoveRange(0, count);
+			return cmds;
+		}
+
+		/// <summary>
+		/// After resimulating input history, re-apply commands predicted since the most recent packet.
+		/// </summary>
+		internal void ClientReplayPendingSourceCmds()
+		{
+			foreach (SourceUserCmd cmd in clientPendingSourceCmds)
+			{
+				RunSourceCmd(cmd);
+			}
+
+			// Snap interpolation to the corrected position.
+			clientHasSourceInterpolation = false;
+		}
+
+		private SourceUserCmd ClientBuildSourceCmd()
+		{
+			SourceUserCmd cmd;
+			cmd.packedYaw = SourceUserCmd.PackYaw(player.look.yaw);
+			cmd.packedPitch = SourceUserCmd.PackPitch(player.look.pitch);
+
+			byte buttons = 0;
+			int moveX = _horizontal - 1;
+			int moveZ = _vertical - 1;
+			if (moveZ > 0)
+			{
+				buttons |= SourceUserCmd.IN_FORWARD;
+			}
+			else if (moveZ < 0)
+			{
+				buttons |= SourceUserCmd.IN_BACK;
+			}
+
+			if (moveX > 0)
+			{
+				buttons |= SourceUserCmd.IN_MOVERIGHT;
+			}
+			else if (moveX < 0)
+			{
+				buttons |= SourceUserCmd.IN_MOVELEFT;
+			}
+
+			if (_jump)
+			{
+				buttons |= SourceUserCmd.IN_JUMP;
+			}
+
+			// Players with crouch set to hold mode should stay crouched while in the rest gesture.
+			if (player.stance.crouch || (player.animator.gesture == EPlayerGesture.REST_START && !player.stance.prone))
+			{
+				buttons |= SourceUserCmd.IN_DUCK;
+			}
+
+			// Sprint key is the CS:S walk key.
+			if (player.stance.sprint)
+			{
+				buttons |= SourceUserCmd.IN_SPEED;
+			}
+
+			cmd.buttons = buttons;
+			return cmd;
+		}
+
+		/// <summary>
+		/// Client samples and predicts one command every 10 ms of frame time, like a Source client running
+		/// usercmds at tickrate 100. Rendering interpolates between the two most recent ticks.
+		/// </summary>
+		private void ClientUpdateSourceMovement()
+		{
+			if (!CanRunSourceCmd || LoadingUI.isBlocked)
+			{
+				clientSourceTickAccumulator = 0.0f;
+				clientHasSourceInterpolation = false;
+				strafeTrainer.Reset();
+				return;
+			}
+
+			Vector3 position = transform.position;
+			if (!clientHasSourceInterpolation || (position - clientSourceInterpolationTo).sqrMagnitude > 1e-8f)
+			{
+				// First tick, or something besides the 100 Hz ticks moved us (teleport, server correction, ladder snap).
+				clientSourceInterpolationFrom = position;
+				clientSourceInterpolationTo = position;
+				clientHasSourceInterpolation = true;
+			}
+
+			clientSourceTickAccumulator += Time.deltaTime;
+			clientSourceTickAccumulator = Mathf.Min(clientSourceTickAccumulator, MAX_CLIENT_SOURCE_TICKS_PER_FRAME * SourceMovement.TICK_INTERVAL);
+
+			while (clientSourceTickAccumulator >= SourceMovement.TICK_INTERVAL)
+			{
+				clientSourceTickAccumulator -= SourceMovement.TICK_INTERVAL;
+
+				SourceUserCmd cmd = ClientBuildSourceCmd();
+				Vector3 before = transform.position;
+				RunSourceCmd(cmd);
+				strafeTrainer.AddTick(source, cmd.Yaw);
+
+				if (clientPendingSourceCmds.Count >= MAX_CLIENT_PENDING_SOURCE_CMDS)
+				{
+					clientPendingSourceCmds.RemoveAt(0);
+				}
+				clientPendingSourceCmds.Add(cmd);
+
+				clientSourceInterpolationFrom = before + (Vector3.up * source.tickOriginShift);
+				clientSourceInterpolationTo = transform.position;
+
+				if (!CanRunSourceCmd)
+				{
+					// E.g., died or entered a vehicle.
+					clientSourceTickAccumulator = 0.0f;
+					clientHasSourceInterpolation = false;
+					break;
+				}
+			}
+		}
+
+		/// <summary>
+		/// Called by SourceMovement when the hull lands.
+		/// </summary>
+		internal void NotifySourceLanded(float verticalVelocity)
+		{
+			checkGround(transform.position);
+			_isGrounded = true;
+
+			onLanded?.Invoke(verticalVelocity);
+
+#if !DEDICATED_SERVER
+			if (!player.input.isResimulating && Mathf.Abs(verticalVelocity) > 1.0f)
+			{
+				PlayLandAudioClip();
+			}
+#endif // !DEDICATED_SERVER
+		}
+
+		/// <summary>
+		/// Called by SourceMovement when ducking or unducking in the air moved the origin to keep the head in place.
+		/// </summary>
+		internal void OnSourceDuckOriginShift(float delta)
+		{
+			if (channel.IsLocalPlayer && !player.input.isResimulating)
+			{
+				player.look.SourceAdjustEyeHeight(-delta);
+			}
+		}
+
+		#endregion
 
 		private void Update()
 		{
@@ -1616,6 +1632,8 @@ namespace SDG.Unturned
 					_horizontal = (byte) (input_x + 1);
 					_vertical = (byte) (input_y + 1);
 				}
+
+				ClientUpdateSourceMovement();
 			}
 
 			UnityEngine.Profiling.Profiler.EndSample();
@@ -1626,7 +1644,15 @@ namespace SDG.Unturned
 			{
 				if (Time.time - lastFootstep > 2.1f / speed)
 				{
+					// CS:S footsteps are silent below a speed threshold, which keeps walk-key and crouch movement quiet.
+					// Measured from position so it works for remote players too.
+					float footstepElapsed = Time.time - lastFootstep;
+					float footstepHorizontalSpeed = footstepElapsed > 0.0f ? (transform.position - lastFootstepPosition).GetHorizontalMagnitude() / footstepElapsed : 0.0f;
+					bool isFootstepAudible = footstepHorizontalSpeed >= SourceMovement.FOOTSTEP_MIN_SPEED * SourceMovement.METERS_PER_UNIT
+						|| player.stance.stance == EPlayerStance.CLIMB;
+
 					lastFootstep = Time.time;
+					lastFootstepPosition = transform.position;
 
 					bool playedLand = false;
 
@@ -1648,7 +1674,7 @@ namespace SDG.Unturned
 							{
 								PlaySwimAudioClip();
 							}
-							else if (!string.IsNullOrEmpty(materialName))
+							else if (!string.IsNullOrEmpty(materialName) && isFootstepAudible)
 							{
 								PlayFootstepAudioClip();
 							}
@@ -1740,6 +1766,13 @@ namespace SDG.Unturned
 				{
 					player.first.localPosition = Vector3.zero;
 					player.third.localPosition = Vector3.zero;
+				}
+				else if (clientHasSourceInterpolation)
+				{
+					// Interpolate between the two most recent 100 Hz ticks.
+					float alpha = Mathf.Clamp01(clientSourceTickAccumulator / SourceMovement.TICK_INTERVAL);
+					player.first.position = Vector3.Lerp(clientSourceInterpolationFrom, clientSourceInterpolationTo, alpha);
+					player.third.position = player.first.position;
 				}
 				else
 				{
@@ -2016,6 +2049,8 @@ namespace SDG.Unturned
 				// 2026-05-04: there is speculation that overlap and sweep tests necessary when overlap recovery is
 				// *disabled* were very expensive on maps with lots of colliders, so we added an option to enable it.
 				controller.enableOverlapRecovery = CharacterControllerExtension.EnableOverlapRecovery;
+
+				source = new SourceMovement(this);
 			}
 
 			if (Provider.isServer)
@@ -2049,6 +2084,7 @@ namespace SDG.Unturned
 			canAddSimulationResultsToUpdates = true;
 
 			lastFootstep = Time.time;
+			lastFootstepPosition = transform.position;
 		}
 
 		private void OnControllerColliderHit(ControllerColliderHit hit)

@@ -90,6 +90,11 @@ namespace SDG.Unturned
 
 		public static Crosshair crosshair;
 
+		/// <summary>
+		/// Strafe trainer and speedometer.
+		/// </summary>
+		public static SleekMovementHud movementHud;
+
 		private static ISleekBox lifeBox;
 		private static ISleekImage healthIcon;
 		private static SleekProgress healthProgress;
@@ -2060,6 +2065,11 @@ namespace SDG.Unturned
 			crosshair.SizeScale_Y = 1.0f;
 			container.AddChild(crosshair);
 			crosshair.SetPluginAllowsCenterDotVisible(Player.LocalPlayer.isPluginWidgetFlagActive(EPluginWidgetFlags.ShowCenterDot));
+
+			movementHud = new SleekMovementHud();
+			movementHud.SizeScale_X = 1.0f;
+			movementHud.SizeScale_Y = 1.0f;
+			container.AddChild(movementHud);
 
 			lifeBox = Glazier.Get().CreateBox();
 			lifeBox.PositionScale_Y = 1.0f;

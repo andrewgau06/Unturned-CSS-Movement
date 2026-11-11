@@ -124,6 +124,29 @@ namespace SDG.Unturned
 			writer.WriteInt32(lastTireOffset);
 			writer.WriteInt32(lastRestOffset);
 		}
+		[NetInvokableGeneratedMethod(nameof(PlayerInput.ReceiveSimulateMispredictedSourceInputs), ENetInvokableGeneratedMethodPurpose.Read)]
+		public static void ReceiveSimulateMispredictedSourceInputs_Read(in ClientInvocationContext context)
+		{
+			NetPakReader reader = context.reader;
+			NetId netId;
+			if (!reader.ReadNetId(out netId))
+			{
+				context.LogWarning("unable to read target instance net id");
+				return;
+			}
+
+			object voidNetObj = NetIdRegistry.Get(netId);
+			if (voidNetObj == null)
+					return;
+			PlayerInput netObj = voidNetObj as PlayerInput;
+			if (netObj == null)
+			{
+				context.LogWarning($"expected target instance with net id {netId} to be type PlayerInput, but was {voidNetObj.GetType().Name}");
+				return;
+			}
+			netObj.ReceiveSimulateMispredictedSourceInputs(context);
+		}
+		// ReceiveSimulateMispredictedSourceInputs write will be called directly.
 		[NetInvokableGeneratedMethod(nameof(PlayerInput.ReceiveAckGoodInputs), ENetInvokableGeneratedMethodPurpose.Read)]
 		public static void ReceiveAckGoodInputs_Read(in ClientInvocationContext context)
 		{

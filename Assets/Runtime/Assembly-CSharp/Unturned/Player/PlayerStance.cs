@@ -133,7 +133,11 @@ namespace SDG.Unturned
 
 		private bool _inShallows;
 
-		internal bool canCurrentStanceTransitionToClimbing => stance == EPlayerStance.STAND || stance == EPlayerStance.SPRINT || stance == EPlayerStance.SWIM;
+		/// <summary>
+		/// Always false: ladders use CS:S ladder movement (SourceMovement.LadderMove), so Unturned's climbing stance
+		/// is never entered automatically or via the [F] climb prompt. The CLIMB code is kept for plugins that set it.
+		/// </summary>
+		internal bool canCurrentStanceTransitionToClimbing => false;
 
 		/// <summary>
 		/// Return false if there are any external restrictions (e.g. reloading, handcuffed) preventing climbing.
@@ -387,25 +391,7 @@ namespace SDG.Unturned
 
 			if (Provider.isServer)
 			{
-				if (player.animator.gesture == EPlayerGesture.INVENTORY_START)
-				{
-					if (newStance != EPlayerStance.STAND && newStance != EPlayerStance.SPRINT && newStance != EPlayerStance.CROUCH)
-					{
-						player.animator.sendGesture(EPlayerGesture.INVENTORY_STOP, false);
-					}
-				}
-				else if (player.animator.gesture == EPlayerGesture.SURRENDER_START)
-				{
-					player.animator.sendGesture(EPlayerGesture.SURRENDER_STOP, true);
-				}
-				else if (player.animator.gesture == EPlayerGesture.REST_START)
-				{
-					player.animator.sendGesture(EPlayerGesture.REST_STOP, true);
-				}
-				else if (player.animator.gesture == EPlayerGesture.T_POSE_START)
-				{
-					player.animator.sendGesture(EPlayerGesture.T_POSE_STOP, true);
-				}
+				serverStopGesturesForStanceChange(newStance);
 			}
 
 			internalSetStance(newStance);
@@ -413,6 +399,52 @@ namespace SDG.Unturned
 			if (Provider.isServer)
 			{
 				replicateStance(/*notifyOwner*/ all);
+			}
+		}
+
+		private void serverStopGesturesForStanceChange(EPlayerStance newStance)
+		{
+			if (player.animator.gesture == EPlayerGesture.INVENTORY_START)
+			{
+				if (newStance != EPlayerStance.STAND && newStance != EPlayerStance.SPRINT && newStance != EPlayerStance.CROUCH)
+				{
+					player.animator.sendGesture(EPlayerGesture.INVENTORY_STOP, false);
+				}
+			}
+			else if (player.animator.gesture == EPlayerGesture.SURRENDER_START)
+			{
+				player.animator.sendGesture(EPlayerGesture.SURRENDER_STOP, true);
+			}
+			else if (player.animator.gesture == EPlayerGesture.REST_START)
+			{
+				player.animator.sendGesture(EPlayerGesture.REST_STOP, true);
+			}
+			else if (player.animator.gesture == EPlayerGesture.T_POSE_START)
+			{
+				player.animator.sendGesture(EPlayerGesture.T_POSE_STOP, true);
+			}
+		}
+
+		/// <summary>
+		/// Standing/crouching is decided by the CS:S duck in SourceMovement at 100 Hz on both the owner and the
+		/// server, so unlike checkStance there is no cooldown or capsule clearance test (the hull test already ran)
+		/// and the owner isn't notified.
+		/// </summary>
+		internal void SetStanceFromSourceMovement(EPlayerStance newStance)
+		{
+			if (newStance == stance)
+				return;
+
+			if (Provider.isServer)
+			{
+				serverStopGesturesForStanceChange(newStance);
+			}
+
+			internalSetStance(newStance);
+
+			if (Provider.isServer)
+			{
+				replicateStance(/*notifyOwner*/ false);
 			}
 		}
 
@@ -674,40 +706,24 @@ namespace SDG.Unturned
 
 			if (stance != EPlayerStance.CLIMB && stance != EPlayerStance.SITTING && stance != EPlayerStance.DRIVING)
 			{
-				// Players with crouch input set to hold mode (rather than toggle) should stay crouched while in rest gesture. 
-				if (inputCrouch || (player.animator.gesture == EPlayerGesture.REST_START && !inputProne))
-				{
-					if (stance != EPlayerStance.CROUCH)
-					{
-						checkStance(EPlayerStance.CROUCH);
-					}
-				}
-				else if (inputProne)
+				// Standing <-> crouching is the CS:S duck, simulated per 100 Hz command by SourceMovement (which
+				// also handles the rest gesture holding duck). Only prone, which CS:S doesn't have, is handled here.
+				bool wantsDuck = inputCrouch || (player.animator.gesture == EPlayerGesture.REST_START && !inputProne);
+				if (inputProne && !wantsDuck)
 				{
 					if (stance != EPlayerStance.PRONE)
 					{
 						checkStance(EPlayerStance.PRONE);
 					}
 				}
-				// Moved into this branch so that crouch->prone or prone->crouch do not "pass through" standing.
-				else if (stance == EPlayerStance.CROUCH || stance == EPlayerStance.PRONE)
+				else if (stance == EPlayerStance.PRONE)
 				{
-					checkStance(EPlayerStance.STAND);
+					// Leaving prone goes straight to crouching if duck is held, so it doesn't "pass through" standing.
+					checkStance(wantsDuck ? EPlayerStance.CROUCH : EPlayerStance.STAND);
 				}
 
-				bool doesEquipmentAllowSprinting = true;
-				if (player.equipment.useable is UseableGun gun && player.equipment.asset is ItemGunAsset gunAsset)
-				{
-					doesEquipmentAllowSprinting = gunAsset.canAimDuringSprint || !gun.isAiming;
-				}
-				if (inputSprint && !player.life.isBroken && player.life.stamina > 0 && doesEquipmentAllowSprinting && player.movement.isMoving)
-				{
-					if (stance == EPlayerStance.STAND)
-					{
-						checkStance(EPlayerStance.SPRINT);
-					}
-				}
-				else if (stance == EPlayerStance.SPRINT)
+				// No sprint stance: the sprint key is the CS:S walk key (see PlayerMovement.ClientBuildSourceCmd).
+				if (stance == EPlayerStance.SPRINT)
 				{
 					checkStance(EPlayerStance.STAND);
 				}
@@ -856,7 +872,8 @@ namespace SDG.Unturned
 					localWantsToSteadyAim = InputEx.GetKey(ControlsSettings.sprint);
 				}
 
-				if ((stance == EPlayerStance.PRONE || stance == EPlayerStance.CROUCH) && InputEx.GetKey(ControlsSettings.jump))
+				// Jumping stands up from prone. Crouch is kept so crouch jumping works like CS:S.
+				if (stance == EPlayerStance.PRONE && InputEx.GetKey(ControlsSettings.jump))
 				{
 					_localWantsToCrouch = false;
 					_localWantsToProne = false;

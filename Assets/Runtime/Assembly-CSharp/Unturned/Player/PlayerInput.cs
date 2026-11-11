@@ -772,6 +772,11 @@ namespace SDG.Unturned
 		public int input_y;
 		public bool jump;
 
+		/// <summary>
+		/// 100 Hz movement commands sent in this frame's packet. Server runs these before stance.simulate.
+		/// </summary>
+		public SourceUserCmd[] sourceCmds;
+
 		// World space rotations to temporarily apply because movement uses them for forward vectors.
 		public Quaternion rotation;
 		public Quaternion aimRotation;
@@ -849,6 +854,13 @@ namespace SDG.Unturned
 
 	public class WalkingPlayerInputPacket : PlayerInputPacket
 	{
+		/// <summary>
+		/// Most 100 Hz movement commands a single packet may carry. Nominally 8 per 80 ms packet, with headroom
+		/// for frame hitches. Commands beyond this wait for the next packet.
+		/// </summary>
+		internal const int MAX_SOURCE_CMDS = 32;
+		private const int SOURCE_CMD_COUNT_BITS = 6;
+
 		public byte analog;
 
 		/// <summary>
@@ -856,12 +868,30 @@ namespace SDG.Unturned
 		/// </summary>
 		public Vector3 clientPosition;
 
+		/// <summary>
+		/// Movement commands the client predicted since its previous packet.
+		/// </summary>
+		internal SourceUserCmd[] sourceCmds;
+		internal int sourceCmdCount;
+
 		public override void read(SteamChannel channel, NetPakReader reader)
 		{
 			base.read(channel, reader);
 
 			reader.ReadUInt8(out analog);
 			reader.ReadClampedVector3(out clientPosition);
+
+			reader.ReadBits(SOURCE_CMD_COUNT_BITS, out uint cmdCount);
+			sourceCmdCount = Mathf.Min((int) cmdCount, MAX_SOURCE_CMDS);
+			sourceCmds = new SourceUserCmd[sourceCmdCount];
+			for (int index = 0; index < sourceCmdCount; ++index)
+			{
+				if (!sourceCmds[index].Read(reader))
+				{
+					sourceCmdCount = index;
+					break;
+				}
+			}
 		}
 
 		public override void write(NetPakWriter writer)
@@ -870,6 +900,13 @@ namespace SDG.Unturned
 
 			writer.WriteUInt8(analog);
 			writer.WriteClampedVector3(clientPosition);
+
+			int cmdCount = sourceCmds != null ? Mathf.Min(sourceCmds.Length, MAX_SOURCE_CMDS) : 0;
+			writer.WriteBits((uint) cmdCount, SOURCE_CMD_COUNT_BITS);
+			for (int index = 0; index < cmdCount; ++index)
+			{
+				sourceCmds[index].Write(writer);
+			}
 		}
 	}
 
@@ -1237,6 +1274,39 @@ namespace SDG.Unturned
 		private byte clientResimulationStamina;
 		private int clientResimulationLastTireOffset;
 		private int clientResimulationLastRestOffset;
+		private SourceMovementState clientResimulationSourceState;
+
+		/// <summary>
+		/// Server budget of 100 Hz movement commands, refilled in real time. Prevents speedhacking by sending
+		/// commands faster than 100 per second while tolerating network jitter and short stalls.
+		/// </summary>
+		private float serverSourceCmdBudget = SERVER_SOURCE_CMD_BUDGET_MAX;
+		private float serverSourceCmdBudgetTime = -1.0f;
+		private const float SERVER_SOURCE_CMD_BUDGET_MAX = SourceMovement.TICK_RATE * 1.5f;
+
+		private int ServerConsumeSourceCmdBudget(int requestedCount)
+		{
+			float now = Time.realtimeSinceStartup;
+			if (serverSourceCmdBudgetTime < 0.0f)
+			{
+				serverSourceCmdBudgetTime = now;
+			}
+
+			serverSourceCmdBudget = Mathf.Min(SERVER_SOURCE_CMD_BUDGET_MAX, serverSourceCmdBudget + ((now - serverSourceCmdBudgetTime) * SourceMovement.TICK_RATE));
+			serverSourceCmdBudgetTime = now;
+
+			int allowedCount = Mathf.Clamp(Mathf.FloorToInt(serverSourceCmdBudget), 0, requestedCount);
+			serverSourceCmdBudget -= allowedCount;
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+			if (allowedCount < requestedCount)
+			{
+				CommandWindow.LogWarning($"Dropped {requestedCount - allowedCount} movement command(s) over budget from {channel.owner.playerID.playerName}");
+			}
+#endif // UNITY_EDITOR || DEVELOPMENT_BUILD
+
+			return allowedCount;
+		}
 
 		private void ClientRemoveInputHistory(uint frameNumber)
 		{
@@ -1319,6 +1389,7 @@ namespace SDG.Unturned
 			player.movement.controller.enabled = true;
 
 			player.movement.velocity = clientResimulationVelocity;
+			player.movement.source?.SetState(clientResimulationSourceState);
 
 			player.life.internalSetStamina(clientResimulationStamina);
 			player.life.lastTire = MathfEx.ClampLongToUInt(clientResimulationFrameNumber - clientResimulationLastTireOffset);
@@ -1329,10 +1400,14 @@ namespace SDG.Unturned
 				transform.rotation = input.rotation;
 				player.look.aim.rotation = input.aimRotation;
 
+				// Same order as the server: the packet's movement commands, then stance.
 				player.life.SimulateStaminaFrame(input.frameNumber);
+				player.movement.SimulateSourceCmds(input.sourceCmds, input.sourceCmds?.Length ?? 0);
 				player.stance.simulate(input.frameNumber, input.crouch, input.prone, input.sprint);
-				player.movement.simulate(input.frameNumber, 0, input.input_x, input.input_y, 0.0f, 0.0f, input.jump, false, RATE);
 			}
+
+			// Commands predicted since the most recent packet.
+			player.movement.ClientReplayPendingSourceCmds();
 
 			transform.rotation = clientRotation;
 			player.look.aim.rotation = clientAimRotation;
@@ -1360,6 +1435,68 @@ Position delta: {(transform.position - oldPosition).magnitude}");
 			clientResimulationStamina = stamina;
 			clientResimulationLastTireOffset = lastTireOffset;
 			clientResimulationLastRestOffset = lastRestOffset;
+		}
+
+		private static readonly ClientInstanceMethod SendSimulateMispredictedSourceInputs = ClientInstanceMethod.Get(typeof(PlayerInput), nameof(ReceiveSimulateMispredictedSourceInputs));
+		/// <summary>
+		/// Notify client there has been a prediction error, so movement needs to be re-simulated.
+		/// Replaces ReceiveSimulateMispredictedInputs with full-precision state and the CS:S movement state.
+		/// </summary>
+		[SteamCall(ESteamCallValidation.ONLY_FROM_SERVER)]
+		public void ReceiveSimulateMispredictedSourceInputs(in ClientInvocationContext context)
+		{
+			NetPakReader reader = context.reader;
+
+			bool success = reader.ReadUInt32(out uint frameNumber);
+			success &= reader.ReadEnum(out EPlayerStance stance);
+			success &= reader.ReadFloat(out float positionX);
+			success &= reader.ReadFloat(out float positionY);
+			success &= reader.ReadFloat(out float positionZ);
+			success &= reader.ReadFloat(out float velocityX);
+			success &= reader.ReadFloat(out float velocityY);
+			success &= reader.ReadFloat(out float velocityZ);
+			success &= reader.ReadUInt8(out byte stamina);
+			success &= reader.ReadInt32(out int lastTireOffset);
+			success &= reader.ReadInt32(out int lastRestOffset);
+			SourceMovementState sourceState = default;
+			success &= sourceState.Read(reader);
+			if (!success)
+			{
+				context.LogWarning("unable to read mispredicted movement state");
+				return;
+			}
+
+			ReceiveSimulateMispredictedInputs(frameNumber, stance, new Vector3(positionX, positionY, positionZ), new Vector3(velocityX, velocityY, velocityZ), stamina, lastTireOffset, lastRestOffset);
+			clientResimulationSourceState = sourceState;
+		}
+
+		private void ServerSendSimulateMispredictedSourceInputs(uint clientFrameNumber)
+		{
+			// Server simulation frame may differ from client, so tell client to offset these
+			// values from client's simulation frame number.
+			int lastTireOffset = (int) (simulation - player.life.lastTire);
+			int lastRestOffset = (int) (simulation - player.life.lastRest);
+			EPlayerStance stance = player.stance.stance;
+			Vector3 position = transform.position;
+			Vector3 velocity = player.movement.velocity;
+			byte stamina = player.life.stamina;
+			SourceMovementState sourceState = player.movement.source != null ? player.movement.source.GetState() : default;
+
+			SendSimulateMispredictedSourceInputs.Invoke(GetNetId(), ENetReliability.Unreliable, channel.GetOwnerTransportConnection(), (NetPakWriter writer) =>
+			{
+				writer.WriteUInt32(clientFrameNumber);
+				writer.WriteEnum(stance);
+				writer.WriteFloat(position.x);
+				writer.WriteFloat(position.y);
+				writer.WriteFloat(position.z);
+				writer.WriteFloat(velocity.x);
+				writer.WriteFloat(velocity.y);
+				writer.WriteFloat(velocity.z);
+				writer.WriteUInt8(stamina);
+				writer.WriteInt32(lastTireOffset);
+				writer.WriteInt32(lastRestOffset);
+				sourceState.Write(writer);
+			});
 		}
 
 		private static readonly ClientInstanceMethod<uint> SendAckGoodInputs = ClientInstanceMethod<uint>.Get(typeof(PlayerInput), nameof(ReceiveAckGoodInputs));
@@ -1578,6 +1715,10 @@ Position delta: {(transform.position - oldPosition).magnitude}");
 					bool inputProne = player.stance.prone;
 					bool inputSprint = player.stance.sprint;
 
+					// 100 Hz movement commands were already predicted in PlayerMovement.Update since the previous
+					// packet. Server replays them before stance.simulate, which is also the order they happened in here.
+					SourceUserCmd[] sourceCmds = player.movement.ClientFlushSourceCmds(WalkingPlayerInputPacket.MAX_SOURCE_CMDS);
+
 					UnityEngine.Profiling.Profiler.BeginSample("Stance");
 					player.stance.simulate(simulation, inputCrouch, inputProne, inputSprint);
 					UnityEngine.Profiling.Profiler.EndSample();
@@ -1605,6 +1746,8 @@ Position delta: {(transform.position - oldPosition).magnitude}");
 							WalkingPlayerInputPacket clientPendingWalkingInput = new WalkingPlayerInputPacket();
 							clientPendingWalkingInput.analog = (byte) ((player.movement.horizontal << 4) | player.movement.vertical);
 							clientPendingWalkingInput.clientPosition = transform.position;
+							clientPendingWalkingInput.sourceCmds = sourceCmds;
+							clientPendingWalkingInput.sourceCmdCount = sourceCmds.Length;
 
 							clientPendingInput = clientPendingWalkingInput;
 
@@ -1616,6 +1759,7 @@ Position delta: {(transform.position - oldPosition).magnitude}");
 							historyInput.input_y = input_y;
 							historyInput.jump = inputJump;
 							historyInput.sprint = inputSprint;
+							historyInput.sourceCmds = sourceCmds;
 							historyInput.rotation = transform.rotation;
 							historyInput.aimRotation = player.look.aim.rotation;
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
@@ -1794,6 +1938,12 @@ Position delta: {(transform.position - oldPosition).magnitude}");
 								player.look.simulate(walkingPacket.yaw, walkingPacket.pitch, RATE);
 								UnityEngine.Profiling.Profiler.EndSample();
 
+								// Replay the client's 100 Hz movement commands before stance, matching client order.
+								UnityEngine.Profiling.Profiler.BeginSample("SourceMove");
+								int allowedSourceCmdCount = ServerConsumeSourceCmdBudget(walkingPacket.sourceCmdCount);
+								player.movement.SimulateSourceCmds(walkingPacket.sourceCmds, allowedSourceCmdCount);
+								UnityEngine.Profiling.Profiler.EndSample();
+
 								UnityEngine.Profiling.Profiler.BeginSample("Stance");
 								player.stance.simulate(simulation, keys[3], keys[4], keys[5]);
 								UnityEngine.Profiling.Profiler.EndSample();
@@ -1826,12 +1976,7 @@ Position delta: {(transform.position - oldPosition).magnitude}");
 										CommandWindow.LogWarning($"Movement misprediction! frame: {walkingPacket.clientSimulationFrameNumber} client: {walkingPacket.clientPosition} server: {serverPosition} distance: {(walkingPacket.clientPosition - serverPosition).magnitude} x: {moveInputX} y: {moveInputY} velocity: {player.movement.velocity} grounded: {player.movement.isGrounded} jump: {moveInputJump}");
 #endif // LOG_INPUT_RESIMULATION || UNITY_EDITOR || DEVELOPMENT_BUILD
 
-										// Server simulation frame may differ from client, so tell client to offset these
-										// values from client's simulation frame number.
-										int lastTireOffset = (int) (simulation - player.life.lastTire);
-										int lastRestOffset = (int) (simulation - player.life.lastRest);
-
-										SendSimulateMispredictedInputs.Invoke(GetNetId(), ENetReliability.Unreliable, channel.GetOwnerTransportConnection(), walkingPacket.clientSimulationFrameNumber, player.stance.stance, serverPosition, player.movement.velocity, player.life.stamina, lastTireOffset, lastRestOffset);
+										ServerSendSimulateMispredictedSourceInputs(walkingPacket.clientSimulationFrameNumber);
 									}
 									else
 									{

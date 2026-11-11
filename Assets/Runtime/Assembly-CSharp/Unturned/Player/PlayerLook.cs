@@ -258,6 +258,16 @@ namespace SDG.Unturned
 		/// </summary>
 		private float thirdPersonEyeHeight;
 
+		/// <summary>
+		/// CS:S ducking/unducking in the air moves the feet instead of the head. Offset the smoothed eye height by the
+		/// opposite amount so the camera stays where it was, then let it settle to the new stance height as usual.
+		/// </summary>
+		internal void SourceAdjustEyeHeight(float delta)
+		{
+			eyes += delta;
+			thirdPersonEyeHeight += delta;
+		}
+
 		public bool shouldUseZoomFactorForSensitivity;
 
 		private EPlayerPerspective _perspective;
