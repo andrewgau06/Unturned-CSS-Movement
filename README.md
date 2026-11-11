@@ -4,8 +4,8 @@ A mod to implement Counter Strike: Source movement with autobunnyhopping to Untu
 
 ## Features
 
-Strafe trainer
-Speedometer
+- Strafe trainer
+- Speedometer
 
 ## Resources
 
